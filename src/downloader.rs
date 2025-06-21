@@ -1,242 +1,237 @@
-use std::path::PathBuf;
-use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
+// src/downloader.rs
+
+use crate::models::{DownloadJob, JobStatus, Segment};
+use futures_util::StreamExt;
+use reqwest::Client;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use thiserror::Error;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::Mutex;
-use reqwest::Client;
-use thiserror::Error;
-use serde::{Serialize, Deserialize};
-use futures_util::StreamExt;
 
-/// Custom errors for download operations.
 #[derive(Debug, Error)]
 pub enum DownloadError {
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("invalid url")]
-    InvalidUrl,
-    #[error("download paused")]
+    #[error("could not get content length from server")]
+    NoContentLength,
+    #[error("download was paused by user")]
     Paused,
+    #[error("task was aborted")]
+    Aborted, // For cancellation
 }
 
-/// Download status enumeration.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum DownloadStatus {
-    Queued,
-    Downloading,
-    Paused,
-    Completed,
-    Failed,
-}
+/// A stateless download worker that executes a DownloadJob.
+pub struct DownloadWorker;
 
-/// Options for a download task.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownloadOptions {
-    pub url: String,
-    pub destination: PathBuf,
-    pub retries: usize,
-    pub timeout: Duration,
-    /// Number of concurrent segments to use when downloading.
-    pub threads: usize,
-}
+impl DownloadWorker {
+    /// Executes or resumes a download job.
+    /// This function handles the entire lifecycle of a single download attempt.
+    pub async fn run(
+        client: &Client,
+        job: Arc<Mutex<DownloadJob>>,
+        pause_flag: Arc<AtomicBool>,
+    ) -> Result<(), DownloadError> {
+        // --- 1. Initialization and State Setup ---
+        Self::initialize_job_state(client, job.clone()).await?;
 
-impl Default for DownloadOptions {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            destination: PathBuf::new(),
-            retries: 3,
-            timeout: Duration::from_secs(30),
-            threads: 4,
-        }
-    }
-}
+         // Clear the pause flag before starting/resuming.
+        pause_flag.store(false, Ordering::SeqCst);
 
-/// Downloader struct manages the downloading of a single file.
-#[derive(Debug)]
-pub struct Downloader {
-    client: Client,
-    options: DownloadOptions,
-    status: Mutex<DownloadStatus>,
-    downloaded: Arc<AtomicU64>,
-    total_size: Arc<AtomicU64>,
-    pause_flag: Arc<AtomicBool>,
-}
-
-impl Downloader {
-    /// Create a new downloader with provided options.
-    pub fn new(options: DownloadOptions) -> Self {
-        let client = Client::new();
-        Self {
-            client,
-            options,
-            status: Mutex::new(DownloadStatus::Queued),
-            downloaded: Arc::new(AtomicU64::new(0)),
-            total_size: Arc::new(AtomicU64::new(0)),
-            pause_flag: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// Begin the download process.
-    pub async fn start(&self) -> Result<(), DownloadError> {
-        {
-            let mut status = self.status.lock().await;
-            *status = DownloadStatus::Downloading;
-        }
-        self.pause_flag.store(false, Ordering::SeqCst);
-
-        let mut attempts = 0;
-        loop {
-            let result = self.download_once().await;
-            match result {
-                Ok(_) => {
-                    let mut status = self.status.lock().await;
-                    *status = DownloadStatus::Completed;
-                    return Ok(());
-                }
-                Err(DownloadError::Paused) => {
-                    let mut status = self.status.lock().await;
-                    *status = DownloadStatus::Paused;
-                    return Err(DownloadError::Paused);
-                }
-                Err(e) => {
-                    attempts += 1;
-                    if attempts > self.options.retries {
-                        let mut status = self.status.lock().await;
-                        *status = DownloadStatus::Failed;
-                        return Err(e);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Pause the download process.
-    pub async fn pause(&self) {
-        self.pause_flag.store(true, Ordering::SeqCst);
-        let mut status = self.status.lock().await;
-        *status = DownloadStatus::Paused;
-    }
-
-    /// Resume the download from pause state.
-    pub async fn resume(&self) -> Result<(), DownloadError> {
-        let status = self.status.lock().await.clone();
-        if status != DownloadStatus::Paused {
-            return Err(DownloadError::Paused);
-        }
-        drop(status);
-        self.start().await
-    }
-
-    /// Internal method to perform one attempt at downloading.
-    async fn download_once(&self) -> Result<(), DownloadError> {
-        let resp = self.client.head(&self.options.url)
-            .timeout(self.options.timeout)
-            .send()
-            .await?;
-        let size = resp.headers()
-            .get(reqwest::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .ok_or(DownloadError::InvalidUrl)?;
-        self.total_size.store(size, Ordering::SeqCst);
-
-        if let Some(parent) = self.options.destination.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&self.options.destination)
-            .await?;
-        let existing = file.metadata().await?.len();
-        if existing < size {
-            file.set_len(size).await?;
-        }
-        self.downloaded.store(existing.min(size), Ordering::SeqCst);
-        drop(file);
-
-        if existing >= size {
-            return Ok(());
-        }
-
-        let start_offset = existing;
-
-        let threads = self.options.threads.max(1);
+        // --- 2. Create and Run Segment Download Tasks ---
         let mut tasks = Vec::new();
-        let remaining = size - start_offset;
-        let chunk_size = remaining / threads as u64;
-        for i in 0..threads {
-            let start = start_offset + i as u64 * chunk_size;
-            let mut end = if i == threads - 1 { size - 1 } else { start + chunk_size - 1 };
-            if end >= size { end = size - 1; }
-            let url = self.options.url.clone();
-            let path = self.options.destination.clone();
-            let client = self.client.clone();
-            let downloaded = self.downloaded.clone();
-            let pause_flag = self.pause_flag.clone();
-            let timeout = self.options.timeout;
+        let num_segments = { job.lock().await.segments.len() };
+
+        for i in 0..num_segments {
+            let job_clone = Arc::clone(&job);
+            let client_clone = client.clone();
+            let pause_clone = Arc::clone(&pause_flag);
+
             tasks.push(tokio::spawn(async move {
-                let mut resp = client.get(&url)
-                    .header(reqwest::header::RANGE, format!("bytes={}-{}", start, end))
-                    .timeout(timeout)
-                    .send()
-                    .await?
-                    .error_for_status()?;
-
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .open(&path)
-                    .await?;
-                file.seek(SeekFrom::Start(start)).await?;
-
-                let mut stream = resp.bytes_stream();
-                while let Some(chunk) = stream.next().await {
-                    if pause_flag.load(Ordering::SeqCst) {
-                        return Err(DownloadError::Paused);
-                    }
-                    let bytes = chunk?;
-                    file.write_all(&bytes).await?;
-                    downloaded.fetch_add(bytes.len() as u64, Ordering::SeqCst);
-                }
-                Ok::<(), DownloadError>(())
+                Self::download_segment(client_clone, job_clone, i, pause_clone).await
             }));
         }
 
-        for task in tasks {
-            task.await??;
+        // --- 3. Await Task Completion and Finalize ---
+        for task_handle in tasks {
+            match task_handle.await {
+                Ok(Ok(_)) => {}
+                Ok(Err(DownloadError::Paused)) => {
+                    // One segment paused, so we stop and return the Paused error
+                    // to signal the manager. The state is already saved by download_segment.
+                    return Err(DownloadError::Paused);
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(DownloadError::Aborted),
+            }
+        }
+        
+              // --- FINALIZATION STEP ---
+        // This runs only if all segment tasks complete without error.
+        let mut job_lock = job.lock().await;
+        if job_lock.progress() >= 1.0 {
+            let temp_path = job_lock.temporary_path();
+            let final_path = job_lock.destination.clone();
+            tokio::fs::rename(temp_path, final_path).await?;
+            job_lock.status = JobStatus::Completed;
+        } else if !pause_flag.load(Ordering::SeqCst) {
+            job_lock.status = JobStatus::Failed(Some("Incomplete download".to_string()));
+        }
+
+        Ok(())
+    }
+    /// Prepares the DownloadJob by fetching metadata and creating segments if needed.
+    /// **MODIFIED FUNCTION**
+    /// Prepares the DownloadJob by fetching metadata, creating segments, or loading resume state.
+    async fn initialize_job_state(
+        client: &Client,
+        job: Arc<Mutex<DownloadJob>>,
+    ) -> Result<(), DownloadError> {
+        let mut job_lock = job.lock().await;
+
+        if job_lock.status == JobStatus::Completed {
+            return Ok(());
+        }
+
+        let temp_path = job_lock.temporary_path();
+
+        // Check if we are resuming. We determine this if segments are already defined.
+        let is_resuming = !job_lock.segments.is_empty();
+
+        if is_resuming {
+            println!("Resuming download for job ID: {}", job_lock.id);
+            // Verify the temporary file exists and has the correct size.
+            // If it's missing or wrong, we might need to restart the download.
+            if let Ok(metadata) = tokio::fs::metadata(&temp_path).await {
+                if metadata.len() != job_lock.total_size {
+                    // The temporary file is corrupt or has changed.
+                    // For now, we'll error out. A more advanced implementation
+                    // could restart the download from scratch.
+                    let reason = "Temporary file size mismatch. Please restart download.".to_string();
+                    job_lock.status = JobStatus::Failed(Some(reason.clone()));
+                    return Err(DownloadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        reason,
+                    )));
+                }
+            } else {
+                // Temporary file is missing.
+                let reason = "Temporary file is missing for resume.".to_string();
+                job_lock.status = JobStatus::Failed(Some(reason.clone()));
+                return Err(DownloadError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    reason,
+                )));
+            }
+        } else {
+            println!("Starting new download for job ID: {}", job_lock.id);
+            // This is a new download. Fetch metadata and create segments.
+            let resp = client.head(&job_lock.url).send().await?;
+            let size = resp
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or(DownloadError::NoContentLength)?;
+            
+            job_lock.total_size = size;
+
+            // Ensure the destination DIRECTORY exists.
+            if let Some(parent) = job_lock.destination.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+
+            // Create and pre-allocate the TEMPORARY file.
+            let file = OpenOptions::new().create(true).write(true).open(&temp_path).await?;
+            file.set_len(size).await?;
+            
+            // Create the segments for the first time.
+            let threads = job_lock.num_threads.max(1);
+            let chunk_size = job_lock.total_size / threads as u64;
+            for i in 0..threads {
+                let start = i as u64 * chunk_size;
+                // Make sure the last segment goes to the very end of the file.
+                let end = if i == threads - 1 {
+                    job_lock.total_size
+                } else {
+                    start + chunk_size
+                };
+                job_lock.segments.push(Segment {
+                    start_byte: start,
+                    end_byte: end,
+                    current_pos: start,
+                });
+            }
+        }
+        
+        job_lock.status = JobStatus::Downloading;
+        Ok(())
+    }
+
+    /// Downloads a single segment of a file.
+    async fn download_segment(
+        client: Client,
+        job: Arc<Mutex<DownloadJob>>,
+        segment_index: usize,
+        pause_flag: Arc<AtomicBool>,
+    ) -> Result<(), DownloadError> {
+        // --- MODIFIED FILE HANDLING ---
+        // The temporary path is now retrieved here.
+        let (url, temp_destination, range_header) = {
+            let job_lock = job.lock().await;
+            let segment = &job_lock.segments[segment_index];
+
+            if segment.is_complete() {
+                return Ok(());
+            }
+
+            // This now correctly starts from the segment's current position,
+            // which is the key to resuming.
+             let range = format!("bytes={}-{}", segment.current_pos, segment.end_byte - 1);
+            (
+                job_lock.url.clone(),
+                job_lock.temporary_path(),
+                range,
+            )
+        };
+
+        let mut resp = client
+            .get(&url)
+            .header(reqwest::header::RANGE, range_header)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?
+            .error_for_status()?;
+        
+        // Open the temporary file for writing.
+        let mut file = OpenOptions::new().write(true).open(&temp_destination).await?;
+
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk_result) = stream.next().await {
+            if pause_flag.load(Ordering::SeqCst) {
+                return Err(DownloadError::Paused);
+            }
+            
+            let chunk = chunk_result?;
+            
+            // Lock scope to update state
+            {
+                let mut job_lock = job.lock().await;
+                let segment = &mut job_lock.segments[segment_index];
+
+                file.seek(SeekFrom::Start(segment.current_pos)).await?;
+                file.write_all(&chunk).await?;
+
+                let bytes_written = chunk.len() as u64;
+                segment.current_pos += bytes_written;
+                job_lock.downloaded_bytes += bytes_written;
+            }
         }
 
         Ok(())
     }
 }
-
-impl Downloader {
-    /// Get the current progress as a fraction in range 0.0..=1.0 if known.
-    pub fn progress(&self) -> Option<f32> {
-        let total = self.total_size.load(Ordering::SeqCst);
-        if total == 0 {
-            return None;
-        }
-        let done = self.downloaded.load(Ordering::SeqCst);
-        Some(done as f32 / total as f32)
-    }
-
-    /// Get the current status of the download.
-    pub async fn status(&self) -> DownloadStatus {
-        *self.status.lock().await
-    }
-
-    /// Verify the SHA-256 checksum of the downloaded file.
-    pub async fn verify_sha256(&self, expected: &str) -> Result<bool, crate::integrity::IntegrityError> {
-        use crate::integrity::sha256_sum;
-        let sum = sha256_sum(&self.options.destination).await?;
-        Ok(sum == expected)
-    }
-}
-

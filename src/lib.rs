@@ -1,13 +1,16 @@
-pub mod downloader;
-pub mod queue;
-pub mod integrity;
+// src/lib.rs
 
-use downloader::{DownloadOptions, Downloader};
-use queue::DownloadQueue;
+pub mod downloader;
+pub mod integrity;
+pub mod manager; // New module
+pub mod models;
+pub mod state_manager;
 
 /// Convenient type alias exposing common structs.
 pub mod prelude {
-    pub use crate::downloader::{DownloadOptions, Downloader, DownloadStatus};
-    pub use crate::queue::{DownloadQueue, DownloadTask};
+    pub use crate::downloader::DownloadWorker;
+    pub use crate::integrity::sha256_sum;
+    pub use crate::manager::{DownloadManager, ManagerError}; // Expose Manager
+    pub use crate::models::{DownloadJob, JobStatus, Segment};
+    pub use crate::state_manager::{StateManager, StateError};
 }
-
