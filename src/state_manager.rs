@@ -17,6 +17,8 @@ pub enum StateError {
 }
 
 /// Manages the persistence of download jobs to an SQLite database.
+// src/state_manager.rs
+#[derive(Clone)] // <-- Add this
 pub struct StateManager {
     conn: Connection,
 }

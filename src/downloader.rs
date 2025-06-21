@@ -36,53 +36,57 @@ impl DownloadWorker {
         job: Arc<Mutex<DownloadJob>>,
         pause_flag: Arc<AtomicBool>,
     ) -> Result<(), DownloadError> {
-        // --- 1. Initialization and State Setup ---
-        Self::initialize_job_state(client, job.clone()).await?;
-
-         // Clear the pause flag before starting/resuming.
-        pause_flag.store(false, Ordering::SeqCst);
-
-        // --- 2. Create and Run Segment Download Tasks ---
-        let mut tasks = Vec::new();
-        let num_segments = { job.lock().await.segments.len() };
-
-        for i in 0..num_segments {
-            let job_clone = Arc::clone(&job);
-            let client_clone = client.clone();
-            let pause_clone = Arc::clone(&pause_flag);
-
-            tasks.push(tokio::spawn(async move {
-                Self::download_segment(client_clone, job_clone, i, pause_clone).await
-            }));
-        }
-
-        // --- 3. Await Task Completion and Finalize ---
-        for task_handle in tasks {
-            match task_handle.await {
-                Ok(Ok(_)) => {}
-                Ok(Err(DownloadError::Paused)) => {
-                    // One segment paused, so we stop and return the Paused error
-                    // to signal the manager. The state is already saved by download_segment.
-                    return Err(DownloadError::Paused);
-                }
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Err(DownloadError::Aborted),
+        loop { // NEW: Add a main loop
+            // If the job is paused, wait here until it's un-paused.
+            if pause_flag.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue; // Go back to the top of the loop and check the flag again.
             }
-        }
-        
-              // --- FINALIZATION STEP ---
-        // This runs only if all segment tasks complete without error.
-        let mut job_lock = job.lock().await;
-        if job_lock.progress() >= 1.0 {
-            let temp_path = job_lock.temporary_path();
-            let final_path = job_lock.destination.clone();
-            tokio::fs::rename(temp_path, final_path).await?;
-            job_lock.status = JobStatus::Completed;
-        } else if !pause_flag.load(Ordering::SeqCst) {
-            job_lock.status = JobStatus::Failed(Some("Incomplete download".to_string()));
-        }
 
-        Ok(())
+            // This only runs if we are not paused.
+            Self::initialize_job_state(client, job.clone()).await?;
+
+            let mut tasks = Vec::new();
+            let num_segments = { job.lock().await.segments.len() };
+
+            for i in 0..num_segments {
+                let job_clone = Arc::clone(&job);
+                let client_clone = client.clone();
+                let pause_clone = Arc::clone(&pause_flag);
+                tasks.push(tokio::spawn(async move {
+                    Self::download_segment(client_clone, job_clone, i, pause_clone).await
+                }));
+            }
+            
+            for task_handle in tasks {
+                match task_handle.await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(DownloadError::Paused)) => {
+                        // A segment was paused. We need to signal the main `run` loop to
+                        // stop and re-evaluate. We can't just `continue` here because
+                        // other segment tasks are still running.
+                        // The simplest way is to return a Paused error, which the outer
+                        // logic will now handle by re-entering the waiting loop.
+                        return Err(DownloadError::Paused);
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err(DownloadError::Aborted),
+                }
+            }
+            
+            let mut job_lock = job.lock().await;
+            if job_lock.progress() >= 1.0 {
+                let temp_path = job_lock.temporary_path();
+                let final_path = job_lock.destination.clone();
+                tokio::fs::rename(temp_path, final_path).await?;
+                job_lock.status = JobStatus::Completed;
+                return Ok(()); // THE ONLY successful exit point.
+            } else if !pause_flag.load(Ordering::SeqCst) {
+                job_lock.status = JobStatus::Failed(Some("Incomplete download".to_string()));
+                return Err(DownloadError::Aborted); // Use a specific error
+            }
+            // If we get here, it means we were paused. The main loop will handle waiting.
+        }
     }
     /// Prepares the DownloadJob by fetching metadata and creating segments if needed.
     /// **MODIFIED FUNCTION**

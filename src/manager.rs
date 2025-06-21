@@ -1,19 +1,18 @@
 // src/manager.rs
 
-// Add new imports
 use crate::downloader::{DownloadError, DownloadWorker};
 use crate::models::{DownloadJob, JobStatus};
 use crate::state_manager::{StateError, StateManager};
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
-use reqwest::{Client, redirect::Policy}; // Import Policy
+use reqwest::Client;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering}; // For pause flags
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration; // For polling delay
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle; // To track running tasks
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Error)]
 pub enum ManagerError {
@@ -29,13 +28,13 @@ pub enum ManagerError {
 pub struct DownloadManager {
     state_manager: StateManager,
     jobs: Arc<Mutex<HashMap<u64, Arc<Mutex<DownloadJob>>>>>,
-    http_client: Client, // A single client for all downloads
+    http_client: Client,
     max_concurrent_downloads: usize,
-    // Tracks the JoinHandles of currently running download workers.
     active_workers: Arc<Mutex<HashMap<u64, JoinHandle<()>>>>,
-    // Tracks pause flags for each job.
+    // Stores cancellation tokens for the saver sub-tasks.
+    cancellation_tokens: Arc<Mutex<HashMap<u64, CancellationToken>>>,
+    // Stores pause flags for downloads.
     pause_flags: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
-    // Add a counter to generate unique job IDs.
     next_job_id: AtomicU64,
 }
 
@@ -44,7 +43,7 @@ impl DownloadManager {
         state_manager: StateManager,
         max_concurrent_downloads: usize,
     ) -> Result<Self, ManagerError> {
-        let jobs_map = Arc::new(Mutex::new(HashMap::new())); // This is the map we will use
+        let jobs_map = Arc::new(Mutex::new(HashMap::new()));
         let loaded_jobs = state_manager.load_all_jobs().await?;
         let mut max_id = 0;
 
@@ -69,43 +68,31 @@ impl DownloadManager {
         Ok(Self {
             state_manager,
             http_client,
-            jobs: jobs_map, // <-- FIX: Use the map we populated from the DB.
+            jobs: jobs_map,
             max_concurrent_downloads,
             active_workers: Arc::new(Mutex::new(HashMap::new())),
+            cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             pause_flags: Arc::new(Mutex::new(HashMap::new())),
             next_job_id: AtomicU64::new(max_id + 1),
         })
     }
     
- /// **NEW PUBLIC METHOD**
-    /// Creates a new download job, saves it, and adds it to the queue.
     pub async fn add_new_job(
         &self,
         url: String,
         destination: PathBuf,
         num_threads: usize,
     ) -> Result<u64, ManagerError> {
-        // Atomically fetch and increment the job ID.
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
-        
         let new_job = DownloadJob::new(job_id, url, destination, num_threads);
         
-        // Save the job to the database first.
         self.state_manager.save_job(&new_job).await?;
-        
-        // Then, add it to the in-memory map.
-        self.jobs
-            .lock()
-            .await
-            .insert(job_id, Arc::new(Mutex::new(new_job)));
+        self.jobs.lock().await.insert(job_id, Arc::new(Mutex::new(new_job)));
             
         println!("Manager: Added new job {} to the queue.", job_id);
-            
         Ok(job_id)
     }
 
-    /// **NEW FUNCTION**
-    /// The main loop of the download manager. This should be spawned as a background task.
     pub async fn run(self: Arc<Self>) {
         loop {
             self.prune_completed_workers().await;
@@ -114,41 +101,29 @@ impl DownloadManager {
             {
                 let jobs_lock = self.jobs.lock().await;
                 let workers_lock = self.active_workers.lock().await;
-
                 let available_slots = self.max_concurrent_downloads.saturating_sub(workers_lock.len());
-                if available_slots == 0 {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-                
-                // Find all queued jobs that are not already running
-                let mut queued_candidates: Vec<_> = jobs_lock.iter()
-                    .filter(|(id, _)| !workers_lock.contains_key(id))
-                    .filter_map(|(_, job_arc)| {
-                        // Use try_lock to avoid deadlocking if a job is being modified elsewhere.
-                        // This is a defensive measure.
-                        if let Ok(job) = job_arc.try_lock() {
-                            if matches!(job.status, JobStatus::Queued) {
-                                Some(job.id)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
+
+                if available_slots > 0 {
+                    let mut queued_candidates: Vec<_> = jobs_lock.iter()
+                        .filter(|(id, _)| !workers_lock.contains_key(id))
+                        .filter_map(|(_, job_arc)| {
+                            if let Ok(job) = job_arc.try_lock() {
+                                if matches!(job.status, JobStatus::Queued) {
+                                    Some(job.id)
+                                } else { None }
+                            } else { None }
+                        })
+                        .collect();
+
+                    queued_candidates.sort();
+
+                    for job_id in queued_candidates.into_iter().take(available_slots) {
+                        if let Some(job_arc) = jobs_lock.get(&job_id) {
+                            startable_jobs.push(job_arc.clone());
                         }
-                    })
-                    .collect();
-
-                // **THE FIX**: Sort candidates by ID to ensure FIFO behavior.
-                queued_candidates.sort();
-
-                // Select the jobs to start based on available capacity.
-                for job_id in queued_candidates.into_iter().take(available_slots) {
-                    if let Some(job_arc) = jobs_lock.get(&job_id) {
-                        startable_jobs.push(job_arc.clone());
                     }
                 }
-            } // Release locks
+            }
 
             for job_arc in startable_jobs {
                 self.spawn_worker(job_arc).await;
@@ -158,14 +133,14 @@ impl DownloadManager {
         }
     }
 
-    /// **NEW FUNCTION**
-    /// Spawns a DownloadWorker for a given job.
     async fn spawn_worker(self: &Arc<Self>, job_arc: Arc<Mutex<DownloadJob>>) {
         let job_id = { job_arc.lock().await.id };
 
-        // Create a new pause flag for this job.
         let pause_flag = Arc::new(AtomicBool::new(false));
+        let cancellation_token = CancellationToken::new();
+
         self.pause_flags.lock().await.insert(job_id, pause_flag.clone());
+        self.cancellation_tokens.lock().await.insert(job_id, cancellation_token.clone());
 
         let self_clone = self.clone();
         let http_client = self.http_client.clone();
@@ -173,20 +148,39 @@ impl DownloadManager {
         let handle = tokio::spawn(async move {
             println!("Worker starting for job ID: {}", job_id);
             
-            // The download logic
+            let saver_handle = {
+                let job_clone_for_saver = job_arc.clone();
+                let state_manager_clone = self_clone.state_manager.clone();
+                let saver_token = cancellation_token.clone();
+
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                            _ = saver_token.cancelled() => { break; }
+                        }
+                        let job = job_clone_for_saver.lock().await;
+                        if matches!(job.status, JobStatus::Downloading) {
+                            if let Err(e) = state_manager_clone.save_job(&job).await {
+                                eprintln!("Periodic save for job {} failed: {}", job.id, e);
+                            }
+                        } else { break; }
+                    }
+                })
+            };
+
             let result = DownloadWorker::run(&http_client, job_arc.clone(), pause_flag).await;
 
-            // After the worker finishes (or fails), update the job state and save it.
+            cancellation_token.cancel();
+            let _ = saver_handle.await;
+
             let mut job_lock = job_arc.lock().await;
             match result {
-                Ok(_) => {
-                    // The run function handles setting the Completed status internally.
-                    println!("Worker for job {} finished successfully.", job_id);
-                }
+                Ok(_) => { println!("Worker for job {} finished successfully.", job_id); },
                 Err(DownloadError::Paused) => {
                     job_lock.status = JobStatus::Paused;
                     println!("Worker for job {} was paused.", job_id);
-                }
+                },
                 Err(e) => {
                     let reason = e.to_string();
                     job_lock.status = JobStatus::Failed(Some(reason));
@@ -194,33 +188,49 @@ impl DownloadManager {
                 }
             }
 
-            // Persist the final state of the job to the database.
             if let Err(e) = self_clone.state_manager.save_job(&job_lock).await {
                 eprintln!("Failed to save final state for job {}: {}", job_id, e);
             }
         });
         
-        // Add the worker's handle to our tracking map.
         self.active_workers.lock().await.insert(job_id, handle);
     }
     
-    /// **NEW FUNCTION**
-    /// Removes workers from the tracking map if they have finished their execution.
     async fn prune_completed_workers(&self) {
-        self.active_workers.lock().await.retain(|_id, handle| !handle.is_finished());
+        // Step 1: Collect the IDs of all workers that have finished.
+        // We do this in a separate scope to release the lock on active_workers quickly.
+        let mut finished_ids = Vec::new();
+        {
+            let workers = self.active_workers.lock().await;
+            for (id, handle) in workers.iter() {
+                if handle.is_finished() {
+                    finished_ids.push(*id);
+                }
+            }
+        } // Lock on active_workers is released here.
+
+        // Step 2: If there are any finished workers, remove them and their
+        // associated resources from all maps.
+        if !finished_ids.is_empty() {
+            // Lock all the maps we need to modify.
+            let mut workers = self.active_workers.lock().await;
+            let mut tokens = self.cancellation_tokens.lock().await;
+            let mut flags = self.pause_flags.lock().await;
+
+            for id in finished_ids {
+                println!("Manager: Pruning completed worker for job {}.", id);
+                workers.remove(&id);
+                tokens.remove(&id);
+                flags.remove(&id);
+            }
+        }
     }
 
-    /// **NEW PUBLIC METHOD**
-    /// Pauses an active download.
     pub async fn pause_download(&self, job_id: u64) -> Result<(), ManagerError> {
         println!("Manager: Received pause request for job {}.", job_id);
-        
-        // Signal the worker to pause by setting its flag to true.
         if let Some(pause_flag) = self.pause_flags.lock().await.get(&job_id) {
             pause_flag.store(true, Ordering::SeqCst);
         } else {
-            // If there's no pause flag, the job might not be running.
-            // We can still update its state if it's Queued.
             let jobs = self.jobs.lock().await;
             if let Some(job_arc) = jobs.get(&job_id) {
                 let mut job = job_arc.lock().await;
@@ -229,16 +239,11 @@ impl DownloadManager {
                     self.state_manager.save_job(&job).await?;
                     println!("Manager: Job {} was Queued, moved to Paused state.", job_id);
                 }
-            } else {
-                return Err(ManagerError::JobNotFound(job_id));
-            }
+            } else { return Err(ManagerError::JobNotFound(job_id)); }
         }
         Ok(())
     }
 
-    /// **NEW PUBLIC METHOD**
-    /// Resumes a paused download by setting its state back to 'Queued'.
-    /// The main 'run' loop will automatically pick it up.
     pub async fn resume_download(&self, job_id: u64) -> Result<(), ManagerError> {
         println!("Manager: Received resume request for job {}.", job_id);
         let jobs = self.jobs.lock().await;
@@ -246,58 +251,42 @@ impl DownloadManager {
             let mut job = job_arc.lock().await;
             if matches!(job.status, JobStatus::Paused) {
                 job.status = JobStatus::Queued;
-                // Save the new state to the database.
                 self.state_manager.save_job(&job).await?;
-                println!("Manager: Job {} set to Queued. It will be picked up by a worker shortly.", job_id);
-                Ok(())
+                println!("Manager: Job {} set to Queued.", job_id);
             } else {
-                // Optionally, handle cases where the job is in another state.
-                // For now, we only act on 'Paused'.
-                println!("Manager: Job {} is not in a Paused state, resume request ignored.", job_id);
-                Ok(())
+                println!("Manager: Job {} is not Paused, resume ignored.", job_id);
             }
+            Ok(())
         } else {
             Err(ManagerError::JobNotFound(job_id))
         }
     }
 
-    /// **NEW PUBLIC METHOD**
-    /// Cancels a download, stops the worker, and optionally deletes the file.
     pub async fn cancel_download(&self, job_id: u64, delete_file: bool) -> Result<(), ManagerError> {
         println!("Manager: Received cancel request for job {}.", job_id);
         
-        // Step 1: Stop the running worker, if any.
-        if let Some(handle) = self.active_workers.lock().await.remove(&job_id) {
-            handle.abort();
-            println!("Manager: Aborted worker for job {}.", job_id);
+        if let Some(token) = self.cancellation_tokens.lock().await.remove(&job_id) {
+            token.cancel();
         }
         self.pause_flags.lock().await.remove(&job_id);
+        
+        if let Some(handle) = self.active_workers.lock().await.remove(&job_id) {
+            handle.abort();
+            let _ = handle.await; // Wait for it to fully stop.
+            println!("Manager: Aborted and awaited worker for job {}.", job_id);
+        }
 
-        // Step 2: Remove the job from the in-memory map.
-        let job_to_delete = self.jobs.lock().await.remove(&job_id);
-
-        if let Some(job_arc) = job_to_delete {
-            // Step 3: Delete the job from the database.
+        if let Some(job_arc) = self.jobs.lock().await.remove(&job_id) {
             self.state_manager.delete_job(job_id).await?;
             println!("Manager: Removed job {} from the database.", job_id);
 
-            // Step 4: Optionally delete the downloaded file(s).
             if delete_file {
                 let job = job_arc.lock().await;
                 let temp_path = job.temporary_path();
                 let final_path = &job.destination;
 
-                if let Err(e) = tokio::fs::remove_file(&temp_path).await {
-                    // It's okay if the file doesn't exist.
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        eprintln!("Could not delete temporary file {:?}: {}", temp_path, e);
-                    }
-                }
-                if let Err(e) = tokio::fs::remove_file(&final_path).await {
-                     if e.kind() != std::io::ErrorKind::NotFound {
-                        eprintln!("Could not delete final file {:?}: {}", final_path, e);
-                    }
-                }
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                let _ = tokio::fs::remove_file(&final_path).await;
                 println!("Manager: Cleaned up files for job {}.", job_id);
             }
             Ok(())
@@ -306,8 +295,6 @@ impl DownloadManager {
         }
     }
 
-
-    /// (Helper for UI/Testing) Returns a clone of all current jobs.
     pub async fn get_all_jobs(&self) -> Vec<DownloadJob> {
         let jobs_lock = self.jobs.lock().await;
         let mut result = Vec::with_capacity(jobs_lock.len());
