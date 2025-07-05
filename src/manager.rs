@@ -13,6 +13,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use crate::limiter::SpeedLimiter;
 
 #[derive(Debug, Error)]
 pub enum ManagerError {
@@ -35,6 +36,7 @@ pub struct DownloadManager {
     cancellation_tokens: Arc<Mutex<HashMap<u64, CancellationToken>>>,
     // Stores pause flags for downloads.
     pause_flags: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    speed_limiter: SpeedLimiter, // New field
     next_job_id: AtomicU64,
 }
 
@@ -73,10 +75,19 @@ impl DownloadManager {
             active_workers: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             pause_flags: Arc::new(Mutex::new(HashMap::new())),
+            speed_limiter: SpeedLimiter::new(0),
             next_job_id: AtomicU64::new(max_id + 1),
         })
     }
     
+    /// **NEW PUBLIC METHOD**
+    /// Sets the global download speed limit in bytes per second.
+    /// A rate of 0 means unlimited.
+    pub async fn set_speed_limit(&self, bytes_per_sec: u64) {
+        println!("Manager: Setting global speed limit to {} bytes/sec.", bytes_per_sec);
+        self.speed_limiter.set_rate(bytes_per_sec).await;
+    }
+
     pub async fn add_new_job(
         &self,
         url: String,
@@ -144,6 +155,8 @@ impl DownloadManager {
 
         let self_clone = self.clone();
         let http_client = self.http_client.clone();
+        // Get a clone of the limiter for the new worker.
+        let limiter_clone = self.speed_limiter.clone();
 
         let handle = tokio::spawn(async move {
             println!("Worker starting for job ID: {}", job_id);
@@ -169,8 +182,10 @@ impl DownloadManager {
                 })
             };
 
-            let result = DownloadWorker::run(&http_client, job_arc.clone(), pause_flag).await;
-
+            // --- THE FIX IS HERE ---
+            // Pass the limiter to the worker.
+            let result = DownloadWorker::run(&http_client, job_arc.clone(), pause_flag, limiter_clone).await;
+            
             cancellation_token.cancel();
             let _ = saver_handle.await;
 

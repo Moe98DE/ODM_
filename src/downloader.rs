@@ -10,6 +10,7 @@ use thiserror::Error;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::Mutex;
+use crate::limiter::SpeedLimiter;
 
 #[derive(Debug, Error)]
 pub enum DownloadError {
@@ -35,6 +36,7 @@ impl DownloadWorker {
         client: &Client,
         job: Arc<Mutex<DownloadJob>>,
         pause_flag: Arc<AtomicBool>,
+        limiter: SpeedLimiter, // Add limiter to signature
     ) -> Result<(), DownloadError> {
         loop { // NEW: Add a main loop
             // If the job is paused, wait here until it's un-paused.
@@ -53,8 +55,9 @@ impl DownloadWorker {
                 let job_clone = Arc::clone(&job);
                 let client_clone = client.clone();
                 let pause_clone = Arc::clone(&pause_flag);
+                let limiter_clone = limiter.clone(); // Clone limiter for the segment task
                 tasks.push(tokio::spawn(async move {
-                    Self::download_segment(client_clone, job_clone, i, pause_clone).await
+                    Self::download_segment(client_clone, job_clone, i, pause_clone, limiter_clone).await
                 }));
             }
             
@@ -182,6 +185,7 @@ impl DownloadWorker {
         job: Arc<Mutex<DownloadJob>>,
         segment_index: usize,
         pause_flag: Arc<AtomicBool>,
+        limiter: SpeedLimiter, // Add limiter to signature
     ) -> Result<(), DownloadError> {
         // --- MODIFIED FILE HANDLING ---
         // The temporary path is now retrieved here.
@@ -222,6 +226,11 @@ impl DownloadWorker {
             
             let chunk = chunk_result?;
             
+            // --- THE CORE CHANGE ---
+            // Before processing the chunk, "take" tokens from the limiter.
+            // This will asynchronously wait if the speed limit is exceeded.
+            limiter.take(chunk.len() as u64).await;
+
             // Lock scope to update state
             {
                 let mut job_lock = job.lock().await;
